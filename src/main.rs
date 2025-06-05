@@ -83,11 +83,14 @@ fn main() {
             }
         }
 
+
         let l = screen_tris.len();
-        screen_tris.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());//sort_by_key(|f| f.1);
+        screen_tris.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         for i in 0..l {
-            if canvas.draw_color() != screen_tris[l-i-1].2 { canvas.set_draw_color(screen_tris[l-i-1].2) }
+            if canvas.draw_color() != screen_tris[(l-1)-i].2 { canvas.set_draw_color(screen_tris[l-i-1].2) }
+            //println!("Draw color set, rasterizing triangle...");
             let frag: Vec<FPoint> = get_points_in_triangle(screen_tris[l-i-1].0);
+            //println!("Pixels determined, drawing points...");
             canvas.draw_points(frag.as_slice());
         }
 

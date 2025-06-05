@@ -40,7 +40,8 @@ pub struct TransformComponent {
     pub transform: Mat4,
     pub invtransform: Mat4,
     pub location: Vec3,
-    pub rotation: Mat4,
+    /*pub rotation: Mat4,*/
+    pub rotation: Vec3,
     pub scale: Vec3,
 
     pub forward: Vec3,
@@ -257,7 +258,7 @@ impl TransformComponent {
         let mut tmat = Mat4::IDENTITY;
         tmat.w_axis = location.extend(1.);
         let rotmat = Mat4::IDENTITY;
-        Self {transform: tmat, invtransform: tmat.inverse(), location: location, rotation: rotmat, scale: Vec3::new(1., 1., 1.), forward: Vec3::new(0.,0.,1.), right: Vec3::new(1.,0.,0.)}
+        Self {transform: tmat, invtransform: tmat.inverse(), location: location, rotation: Vec3::ZERO, scale: Vec3::new(1., 1., 1.), forward: Vec3::new(0.,0.,1.), right: Vec3::new(1.,0.,0.)}
     }
 
     pub fn offset(&mut self, delta: Vec3) {
@@ -271,6 +272,7 @@ impl TransformComponent {
 
     pub fn rotate(&mut self, /* 0 is X, 1 is Y, 2 is Z */ local_axis: i8, delta_degs: f32) {
         let drads = f32::to_radians(delta_degs);
+        /*
         //println!("Angle: {} radians\nOld Rotation: {}", drads, self.rotation);
         // let cosine = f32::cos(drads);
         // let sine = f32::sin(drads);
@@ -300,12 +302,28 @@ impl TransformComponent {
         self.rotation.x_axis = self.rotation.x_axis.normalize();
         self.rotation.z_axis = self.rotation.z_axis.normalize();
         self.rotation.y_axis = self.rotation.y_axis.normalize();
+        */
+
+        match local_axis {
+            0 => {
+                self.rotation.x += delta_degs;
+            },
+            1 => {
+                self.rotation.y += delta_degs;
+            },
+            2 => {
+                self.rotation.z += delta_degs;
+            },
+            _ => panic!("Invalid local axis: please use 0 for x, 1 for y, or 2 for z")
+        }
+
         self.update_transform();
 
         //println!("New Rotation: {}\n", self.rotation)
     }
 
     pub fn update_transform(&mut self) {
+        /*
         // Truncate to Vec3 and normalize the rotation matrix columns
         let z_axis = self.rotation.z_axis.truncate().normalize(); // Forward vector
         let x_axis = self.rotation.x_axis.truncate().normalize(); // Right vector
@@ -329,11 +347,23 @@ impl TransformComponent {
                                                                 &Mat4::IDENTITY
                                                             )
                                                         )
-                                                    );
+                                                    );*/
+        
+        let translation = Mat4::from_translation(Vec3::from(self.location));
+        let rotation_x = Mat4::from_rotation_x(self.rotation.x.to_radians());
+        let rotation_y = Mat4::from_rotation_y(self.rotation.y.to_radians());
+        let rotation_z = Mat4::from_rotation_z(self.rotation.z.to_radians());
+        let scaling = Mat4::from_scale(Vec3::from(self.scale));
+
+        self.transform = translation * scaling * rotation_z * rotation_y * rotation_x;
+
         self.invtransform = self.transform.inverse();
 
-        self.forward = self.rotation.project_point3(Vec3 {x: 0., y: 0., z: 1.});
-        self.right = self.rotation.project_point3(Vec3 {x: 1., y: 0., z: 0.});
+        self.forward = (rotation_z * rotation_y * rotation_x).transform_vector3(Vec3::new(0., 0., 1.));
+        self.right = (rotation_z * rotation_y * rotation_x).transform_vector3(Vec3::new(1., 0., 0.));
+
+        /*self.forward = self.rotation.project_point3(Vec3 {x: 0., y: 0., z: 1.});
+        self.right = self.rotation.project_point3(Vec3 {x: 1., y: 0., z: 0.});*/
     }
     
     pub fn scalematrix(&self) -> Mat4 {
@@ -378,8 +408,28 @@ pub fn get_points_in_triangle(tri: [FPoint; 3]) -> Vec<FPoint> {
 
     let mut frag = Vec::new();
     if max_y > min_y && max_x > min_x {
+        let mut printed_yet = false;
         for i in 0..=(max_y-min_y).trunc() as i32 {
             for j in 0..=(max_x-min_x).trunc() as i32 {
+                // Check if the point (j, i) is inside the triangle using Sebastian Lague's vector "point on the right side" method
+                let v0 = Vec3::new(tri[2].x - tri[0].x, tri[2].y - tri[0].y, 0.);
+                let v1 = Vec3::new(tri[1].x - tri[0].x, tri[1].y - tri[0].y, 0.);
+                let v2 = Vec3::new(j as f32 + min_x - tri[0].x, i as f32 + min_y - tri[0].y, 0.);
+                let dot00 = v0.dot(v0);
+                let dot01 = v0.dot(v1);
+                let dot02 = v0.dot(v2);
+                let dot11 = v1.dot(v1);
+                let dot12 = v1.dot(v2);
+                let inv_denom = 1. / (dot00 * dot11 - dot01 * dot01);
+                let u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
+                let v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
+                if !printed_yet {println!("math!"); printed_yet = true;}
+                // If u and v are both between 0 and 1, the point is inside the triangle
+                if u >= 0. && v >= 0. && (u + v) <= 1. {
+                    frag.push(FPoint::new(j as f32 + min_x, i as f32 + min_y));
+                }
+
+                /*
                 // Should REALLY convert this to Sebastian Lague's vector stuff, not barycentric coords
                 let y1 = tri[0].y - min_y;
                 let y2 = tri[1].y - min_y;
@@ -391,18 +441,22 @@ pub fn get_points_in_triangle(tri: [FPoint; 3]) -> Vec<FPoint> {
                 
                 let w1;
                 let w2;
-                //if denom.abs() < 0.1 {println!("denom: {}", denom);}
+                println!("barycentric coord parameters set up; preparing to divide...");
                 if denom != 0. {
                     w1 = ((y2 - y3) * (j as f32 - x3) + (x3 - x2) * (i as f32 - y3)) as f32 / denom as f32;
                     w2 = ((y3 - y1) * (j as f32 - x3) + (x1 - x3) * (i as f32 - y3)) as f32 / denom as f32;
+                    //println!("successful division by nonzero denom");
                 } else {
                     w1 = ((y2 - y3) * (j as f32 - x3) + (x3 - x2) * (i as f32 - y3)) as f32;
                     w2 = ((y3 - y1) * (j as f32 - x3) + (x1 - x3) * (i as f32 - y3)) as f32;
+                    //println!("successful ignoring of denom 0");
                 }
+                println!("division complete; comparing w-components...");
                 let w3 = 1. - w1 - w2;
                 if w3 >= 0. && w2 >= 0. && w1 >= 0. {
                     frag.push(FPoint::new(j as f32 + min_x, i as f32 + min_y))
                 }
+                */
             }
         }
     }
