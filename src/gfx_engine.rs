@@ -73,14 +73,10 @@ impl<'a> Surface<'a> {
         tris.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap().reverse()); // We draw the triangles from back to front because we haven't yet implemented overdraw protection
 
         for i in 0..l {
-            println!("chkpt 1");
             // Collect the pixels in the triangle which have not already been drawn this frame
             let clr = materials[tris[i].2].color;
-            println!("chkpt 2");
             let mut frag: Vec<FPoint> = Self::get_points_in_triangle(tris[i].0);
-            println!("chkpt 3");
             //frag.retain(|x| !(drawnpx.contains(x))); // Why the heck doesn't this work?
-            println!("chkpt 4");
             // Draw the collected pixels to the pixel buffer
             for p in frag.iter() {
                 let x = p.x as u32;

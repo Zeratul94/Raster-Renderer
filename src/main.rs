@@ -14,6 +14,7 @@ pub use geo_engine::*;
 use sdl3::pixels::{Color, PixelFormat};
 use sdl3::render::{FPoint, Texture, TextureAccess};
 use sdl3::keyboard::Keycode;
+use sdl3::event::Event::KeyDown;
 
 use glam::Vec3;
 
@@ -28,7 +29,7 @@ fn main() {
     //Read the OBJ file's data
     let uwb = std::env::current_dir().unwrap();
     let path_prefix = uwb.to_str().unwrap();
-    let local_path = "/resources/Leviathan";
+    let local_path = "/resources/CubeScene";
     let mut verts = Vec::new();
     let mut tris = Vec::new();
     let mut matIdcs = Vec::new();
@@ -52,17 +53,20 @@ fn main() {
     
     let mut event_pump = sdl.event_pump().unwrap();
 
-    //let mut now: std::time::Instant;
+    let mut framectr: u8 = 0;
+    let mut frametime_avg = 0.;
     'gl: loop {
+        let start_frametime = std::time::Instant::now();
         for event in event_pump.poll_iter() {match event {
                 sdl3::event::Event::Quit {..} | sdl3::event::Event::KeyDown { keycode: Some(Keycode::Escape), .. } => break 'gl,
                 sdl3::event::Event::MouseMotion { xrel, yrel, .. } => {viewer.transform.rotate(1, xrel as f32 * 1.);
                                                                                  viewer.transform.rotate(0, yrel as f32 * -1.);},
-                sdl3::event::Event::KeyDown { keycode: Some(Keycode::Right), .. } => viewer.transform.rotate(1, 5.),
-                sdl3::event::Event::KeyDown { keycode: Some(Keycode::W), .. } => viewer.transform.offset(viewer.transform.forward * move_speed),
-                sdl3::event::Event::KeyDown { keycode: Some(Keycode::S), .. } => viewer.transform.offset(viewer.transform.forward * -move_speed),
-                sdl3::event::Event::KeyDown { keycode: Some(Keycode::A), .. } => viewer.transform.offset(viewer.transform.right * -move_speed),
-                sdl3::event::Event::KeyDown { keycode: Some(Keycode::D), .. } => viewer.transform.offset(viewer.transform.right * move_speed),
+                KeyDown { keycode: Some(Keycode::Right), .. } => viewer.transform.rotate(1, 5.),
+                KeyDown { keycode: Some(Keycode::W), .. } => viewer.transform.offset(viewer.transform.forward * move_speed),
+                KeyDown { keycode: Some(Keycode::S), .. } => viewer.transform.offset(viewer.transform.forward * -move_speed),
+                KeyDown { keycode: Some(Keycode::A), .. } => viewer.transform.offset(viewer.transform.right * -move_speed),
+                KeyDown { keycode: Some(Keycode::D), .. } => viewer.transform.offset(viewer.transform.right * move_speed),
+                KeyDown { keycode: Some(Keycode::Q), .. } => println!("Avg frame time {} ms", frametime_avg),
                 _ => {},
             }}
         
@@ -92,7 +96,14 @@ fn main() {
         canvas.clear();
         canvas.copy(&render_surf.render_tex, None, None);
         canvas.present();
-        std::thread::sleep(std::time::Duration::new(0, 1_000_000_000u32 / 144 as u32));
+        //std::thread::sleep(std::time::Duration::new(0, 1_000_000_000u32 / 144 as u32));
+        if framectr < 15. as u8 {
+            framectr += 1;
+        } else {
+            frametime_avg -= frametime_avg / 15.;
+        }
+        frametime_avg += (start_frametime.elapsed().as_secs_f32() * 1000.)/15.;
+
     }
     
 }
