@@ -89,6 +89,7 @@ fn main() {
             }
         }
 
+        // Draw the projected geometry to the render surface
         render_surf.render_tris(&mut screen_tris, &materials);
 
     // Present the scene and FPS Timestep

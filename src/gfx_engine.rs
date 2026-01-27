@@ -67,68 +67,56 @@ impl<'a> Surface<'a> {
     //      your_canvas.copy(&this_surface.render_tex, your_src_or_None, your_dst_or_None);
     pub fn render_tris(&mut self, tris: &mut Vec<([FPoint; 3], f32, usize)>, materials: &Vec<Material>) {
         // Rasterize the projected triangles, and bake them to a texture
-        let mut drawnpx: Vec<FPoint> = Vec::new();
+        let mut drawndepths = vec![f32::MAX; self.width as usize * self.height as usize];
         self.px_buf.fill(0);
         let l = tris.len();
-        tris.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap().reverse()); // We draw the triangles from back to front because we haven't yet implemented overdraw protection
+        tris.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap()); // Sort triangles front-to-back
+
+        let bytes_per_pixel = self.pixel_format.bytes_per_pixel() as usize;
+        let masks = self.pixel_format.into_masks().unwrap();
+
+        // Find which byte (0, 1, 2, or 3) corresponds to which color channel. Gemini wrote this.
+        let mut r_offset = None;
+        let mut g_offset = None;
+        let mut b_offset = None;
+        let mut a_offset = None;
+
+        for subidx in 0..bytes_per_pixel {
+            let shift = subidx * 8;
+            if (masks.rmask >> shift & 0xFF) != 0 { r_offset = Some(subidx); }
+            if (masks.gmask >> shift & 0xFF) != 0 { g_offset = Some(subidx); }
+            if (masks.bmask >> shift & 0xFF) != 0 { b_offset = Some(subidx); }
+            if (masks.amask >> shift & 0xFF) != 0 { a_offset = Some(subidx); }
+        }
 
         for i in 0..l {
-            // Collect the pixels in the triangle which have not already been drawn this frame
-            let clr = materials[tris[i].2].color;
-            let mut frag: Vec<FPoint> = Self::get_points_in_triangle(tris[i].0);
-            //frag.retain(|x| !(drawnpx.contains(x))); // Why the heck doesn't this work?
-            // Draw the collected pixels to the pixel buffer
-            for p in frag.iter() {
-                let x = p.x as u32;
-                let y = p.y as u32;
-                if !p.x.is_finite() || !p.y.is_finite()
-                 || p.x < 0. || p.y < 0.
-                 || x > self.width as u32 - 1 || y > self.height as u32 - 1 { continue; }
-                
-                let bytes_per_pixel = self.pixel_format.bytes_per_pixel() as usize;
-                let idx = ((y * self.width as u32 + x) * bytes_per_pixel as u32) as usize;
-                if idx + bytes_per_pixel > self.px_buf.len() {continue;}
-                
-                let masks = self.pixel_format.into_masks().unwrap();
-                
-                for subidx in 0..self.pixel_format.bytes_per_pixel() as usize {
-                    if (masks.rmask >> (subidx * 8) & 0xFF) != 0 {
-                        self.px_buf[idx + subidx] = clr.r;
-                    } else if (masks.gmask >> (subidx * 8) & 0xFF) != 0 {
-                        self.px_buf[idx + subidx] = clr.g;
-                    } else if (masks.bmask >> (subidx * 8) & 0xFF) != 0 {
-                        self.px_buf[idx + subidx] = clr.b;
-                    } else if (masks.amask >> (subidx * 8) & 0xFF) != 0 {
-                        self.px_buf[idx + subidx] = clr.a;
-                    } else {
-                        self.px_buf[idx + subidx] = 0;
-                    }
-                }
-            }
-            drawnpx.extend(frag.iter());
+            self.draw_points_in_triangle(tris[i], &mut drawndepths, bytes_per_pixel, [r_offset, g_offset, b_offset, a_offset], materials);
         }
 
         // Write to the texture
         self.render_tex.update(None, &self.px_buf, self.width as usize * self.pixel_format.bytes_per_pixel() as usize).unwrap();
     }
 
-}
-
-// Static methods for Surface
-impl Surface<'_> {
-    // Static method to convert a triangle on the screen and get the
-    // pixels to draw to render it
-    fn get_points_in_triangle(tri: [FPoint; 3]) -> Vec<FPoint> {
+    fn draw_points_in_triangle(&mut self, tri_data: ([FPoint; 3], f32, usize), drawndepths: &mut Vec<f32>, bytes_per_pixel: usize, channel_offsets: [Option<usize>; 4], materials: &Vec<Material>) {
+        let tri = tri_data.0;
+            let clr = materials[tri_data.2].color;
         let min_x = f32::min(f32::min(tri[0].x, tri[1].x), tri[2].x);
         let max_x = f32::max(f32::max(tri[0].x, tri[1].x), tri[2].x);
         let min_y = f32::min(f32::min(tri[0].y, tri[1].y), tri[2].y);
         let max_y = f32::max(f32::max(tri[0].y, tri[1].y), tri[2].y);
 
+        // Clamp to screen bounds (Gemini wrote this little snippet)
+        let start_x = (min_x.max(0.0).floor() as u16).min(self.width);
+        let end_x   = (max_x.min(self.width as f32 - 1.0).ceil() as u16).min(self.width);
+        let start_y = (min_y.max(0.0).floor() as u16).min(self.height);
+        let end_y   = (max_y.min(self.height as f32 - 1.0).ceil() as u16).min(self.height);
+
+        // Get the pixels contained by the triangle
         let mut frag = Vec::new();
-        if max_y > min_y && max_x > min_x {
+        if end_y > start_y && end_x > start_x {
             //let mut printed_yet = false; //DEBUG
-            for i in 0..=(max_y-min_y).trunc() as i32 {
-                for j in 0..=(max_x-min_x).trunc() as i32 {
+            for i in 0..=(end_y-start_y) as i32 {
+                for j in 0..=(end_x-start_x) as i32 {
                     // Check if the point (j, i) is inside the triangle using Sebastian Lague's vector "point on the right side" method
                     let v0 = Vec3::new(tri[2].x - tri[0].x, tri[2].y - tri[0].y, 0.);
                     let v1 = Vec3::new(tri[1].x - tri[0].x, tri[1].y - tri[0].y, 0.);
@@ -146,10 +134,25 @@ impl Surface<'_> {
                     // If u and v are both between 0 and 1, the point is inside the triangle
                     if u >= 0. && v >= 0. && (u + v) <= 1. {
                         frag.push(FPoint::new(j as f32 + min_x, i as f32 + min_y));
+                        let x = (j as f32 + min_x) as u32;
+                        let y = (i as f32 + min_y) as u32;
+                        
+                        let px_idx = (y * self.width as u32 + x) as usize;
+                        let byte_idx = px_idx * bytes_per_pixel;
+
+                        if tri_data.1 >= drawndepths[px_idx] || byte_idx + bytes_per_pixel > self.px_buf.len() {
+                            continue;
+                        }
+
+                        if let Some(off) = channel_offsets[0] { self.px_buf[byte_idx + off] = clr.r; }
+                        if let Some(off) = channel_offsets[1] { self.px_buf[byte_idx + off] = clr.g; }
+                        if let Some(off) = channel_offsets[2] { self.px_buf[byte_idx + off] = clr.b; }
+                        if let Some(off) = channel_offsets[3] { self.px_buf[byte_idx + off] = clr.a; }
+
+                        drawndepths[px_idx] = tri_data.1;
                     }
                 }
             }
         }
-        return frag;
     }
 }
