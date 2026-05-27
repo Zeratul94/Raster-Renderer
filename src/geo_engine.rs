@@ -7,11 +7,12 @@ extern crate rand;
 
 use crate::gfx_engine;
 
+use gfx_engine::ScreenTri;
+
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::io::BufReader;
 
-use sdl3::pixels::Color;
 use sdl3::render::FPoint;
 
 use glam::Mat4;
@@ -22,10 +23,29 @@ use gfx_engine::Material;
 
 /* Structs */
 
+pub struct MaterialLibrary {
+    pub materials: Vec<Material>,
+    pub name_to_idx: HashMap<String, usize>,
+}
+
 #[derive(Clone, Copy)]
 pub struct Plane {
     pub normal: Vec3,
     pub samplepoint: Vec3
+}
+
+#[derive(Clone, Copy)]
+pub struct VertexData {
+    pub normal: Vec3,
+    pub position: Vec3,
+    pub depth: f32
+}
+
+pub struct Mesh {
+    pub transform: TransformComponent,
+    verts: Vec<VertexData>,
+    tris: Vec<[usize; 3]>,
+    matIdcs: Vec<usize>,
 }
 
 pub struct Camera {
@@ -37,7 +57,8 @@ pub struct Camera {
     pub aspect_ratio: f32,
     pixelscale: f32,
 
-    frustum_planes: [Plane; 6]
+    local_frustum_planes: [Plane; 6],
+    pub world_frustum_planes: [Plane; 6]
 }
 
 pub struct TransformComponent {
@@ -55,13 +76,40 @@ pub struct TransformComponent {
 
 /* Implementations */
 
+impl MaterialLibrary {
+    pub fn new() -> Self {
+        Self {
+            materials: Vec::new(),
+            name_to_idx: HashMap::new(),
+        }
+    }
+
+    pub fn get_or_add(&mut self, name: &str, material: Material) -> usize {
+        if let Some(&idx) = self.name_to_idx.get(name) {
+            idx
+        } else {
+            let idx = self.materials.len();
+            self.materials.push(material);
+            self.name_to_idx.insert(name.to_string(), idx);
+            idx
+        }
+    }
+}
+
 impl Plane {
-    pub fn intersect_line(&self, line_start: Vec3, line_end: Vec3) -> Vec3 {
+    // Intersects a line segment with the plane, returning the intersection point if there is one
+    pub fn intersect_line(&self, line_start: Vec3, line_end: Vec3) -> Option<Vec3> {
         let line_slope = line_end - line_start;
         
-        if self.normal.dot(line_slope).abs() < 0.1 {println!("slope denom: {}", self.normal.dot(line_slope));}
         let t = -self.normal.dot(line_start - self.samplepoint) / self.normal.dot(line_slope);
-        line_slope*t + line_start
+        if t >= 0. && t <= 1. {Some(line_slope*t + line_start)} else {None}
+    }
+    // Intersects a line segment with the plane, returning the interpolation factor t at which the intersection occurs
+    pub fn intersect_line_factor(&self, line_start: Vec3, line_end: Vec3) -> f32 {
+        let line_slope = line_end - line_start;
+        
+        let t = -self.normal.dot(line_start - self.samplepoint) / self.normal.dot(line_slope);
+        t
     }
 }
 
@@ -75,8 +123,133 @@ impl std::fmt::Display for Plane {
     }
 }
 
-impl Camera {
-    
+impl VertexData {
+    fn lerp(self, rhs: VertexData, t: f32) -> Self {
+        Self {
+            normal: self.normal + (rhs.normal - self.normal) * t,
+            position: self.position + (rhs.position - self.position) * t,
+            depth: self.depth + (rhs.depth - self.depth) * t,
+        }
+    }
+}
+
+impl Mesh {
+    pub fn from_obj(path_prefix: &str, p: &str, location: Vec3, mat_lib: &mut MaterialLibrary) -> Self {
+        println!("reading {}...", p);
+
+        let mut vert_target = Vec::new();
+        let mut tri_target = Vec::new();
+        let mut matIdcs_target = Vec::new();
+
+        // Materials
+        let mtl_path = format!("{}{}.mtl", path_prefix, p);
+        let r_file_mats = std::fs::File::open(&mtl_path)
+            .expect(&format!("mtl file '{}' not found at location {}", p, mtl_path));
+        let f_mats = BufReader::new(r_file_mats);
+        
+        let mut current_mat_name: String = String::new();
+        let mut temp_materials = HashMap::new();
+        let mut mat_col = Material::DEFAULT.base_color;
+
+        for line in f_mats.lines().filter_map(|result| result.ok()) {
+            if !line.is_empty() {
+                let segs: Vec<&str> = line.split_whitespace().collect();
+                if segs.is_empty() { continue; }
+                if segs[0] == "newmtl" {
+                    current_mat_name = segs[1].to_string();
+                } else if segs[0] == "Kd" {
+                    mat_col = glam::Vec4::new(
+                        segs[1].parse::<f32>().unwrap(),
+                        segs[2].parse::<f32>().unwrap(),
+                        segs[3].parse::<f32>().unwrap(),
+                        1.0,
+                    );
+                }
+                // Store the material under the current name in a temporary map for this OBJ
+                temp_materials.insert(current_mat_name.clone(), Material { base_color: mat_col });
+            }
+        }
+
+        // Geometry
+        let obj_path = format!("{}{}.obj", path_prefix, p);
+        let r_file_geo = std::fs::File::open(&obj_path).expect("obj file not found!");
+        let f_geo = BufReader::new(r_file_geo);
+        let mut vert_pos = Vec::new();
+        let mut vert_norm = Vec::new();
+        let mut active_mat_name = String::new();
+
+        for line in f_geo.lines().filter_map(|result| result.ok()) {
+            if line.is_empty() { continue; }
+            let chars: Vec<char> = line.chars().collect();
+            let segs: Vec<&str> = line.split_whitespace().collect();
+            if segs.is_empty() { continue; }
+
+            // Verts and Faces (usually starting with 'v ' or 'f ')
+            if chars.len() > 1 && chars[1] == ' ' {
+                match chars[0] {
+                    'v' => {
+                        vert_pos.push(Vec3 {
+                            x: segs[1].parse().unwrap(),
+                            y: segs[2].parse().unwrap(),
+                            z: segs[3].parse().unwrap(),
+                        });
+                    }
+                    'f' => {
+                        let corners = &segs[1..4];
+                        let start_idx = vert_target.len();
+
+                        for corner in corners {
+                            let parts: Vec<&str> = corner.split('/').collect();
+                            let v_idx = parts[0].parse::<usize>().unwrap() - 1;
+                            let vn_idx = if parts.len() >= 3 && !parts[2].is_empty() {
+                                parts[2].parse::<usize>().unwrap() - 1
+                            } else {
+                                0
+                            };
+
+                            vert_target.push(VertexData {
+                                position: vert_pos[v_idx],
+                                normal: if vert_norm.is_empty() { Vec3::ZERO } else { vert_norm[vn_idx] },
+                                depth: 0.0,
+                            });
+                        }
+
+                        tri_target.push([start_idx, start_idx + 1, start_idx + 2]);
+
+                        // Add material to global library if not already there, and store index
+                        if let Some(mat) = temp_materials.get(&active_mat_name) {
+                            matIdcs_target.push(mat_lib.get_or_add(&active_mat_name, *mat));
+                        } else {
+                            matIdcs_target.push(0); // Fallback
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                // Normals and Material switches
+                if segs[0] == "vn" {
+                    vert_norm.push(Vec3 {
+                        x: segs[1].parse().unwrap(),
+                        y: segs[2].parse().unwrap(),
+                        z: segs[3].parse().unwrap(),
+                    });
+                } else if segs[0] == "usemtl" {
+                    active_mat_name = segs[1].to_string();
+                }
+            }
+        }
+        println!("done!");
+
+        Self {
+            transform: TransformComponent::new(location),
+            verts: vert_target,
+            tris: tri_target,
+            matIdcs: matIdcs_target
+        }
+    }
+}
+
+impl Camera {    
     pub fn new(location: Vec3, focal_length: f32, target_width: u32, target_height: u32, draw_dist: f32, clip_dist: f32, frustum_inset: f32) -> Self {
         let pmat = Mat4::from_cols_array_2d(&[[focal_length, 0., 0., 0.], [0., focal_length, 0., 0.], [0., 0., 1., focal_length], [0., 0., 0., 0.]]);
         let aspect = target_width as f32 / target_height as f32;
@@ -95,26 +268,87 @@ impl Camera {
         let se_dir = Vec3::new(hw, hh, focal_length);
         let sw_dir = Vec3::new(-hw, hh, focal_length);
 
-        let frustum_planes = [Plane { normal: (nw_dir.cross(ne_dir)).normalize(), samplepoint: nw },
+        let local_frustum_planes = [Plane { normal: (nw_dir.cross(ne_dir)).normalize(), samplepoint: nw },
                                          Plane { normal: (ne_dir.cross(se_dir)).normalize(), samplepoint: ne },
                                          Plane { normal: (se_dir.cross(sw_dir)).normalize(), samplepoint: se },
                                          Plane { normal: (sw_dir.cross(nw_dir)).normalize(), samplepoint: sw },
                                          Plane { normal: Vec3::new(0., 0., 1.), samplepoint: Vec3::new(0., 0., clip_dist) },
                                          Plane { normal: Vec3::new(0., 0., -1.), samplepoint: Vec3::new(0., 0., draw_dist) }];
-        //println!("{},\n{},\n{},\n{},\n{},\n{}", frustum_planes[0], frustum_planes[1], frustum_planes[2], frustum_planes[3], frustum_planes[4], frustum_planes[5]);
-        Self {transform: TransformComponent::new(location), focal_length: focal_length, proj_mat: pmat, target_width: target_width, target_height: target_height, aspect_ratio: aspect, pixelscale: 75., frustum_planes: frustum_planes}
+        
+        let mut cam = Self {transform: TransformComponent::new(location), focal_length: focal_length, proj_mat: pmat,
+                                    target_width: target_width, target_height: target_height, aspect_ratio: aspect, pixelscale: 75., local_frustum_planes, world_frustum_planes: local_frustum_planes};
+        cam.update_frustum_planes();
+        cam
     }
 
+    pub fn update_frustum_planes(&mut self) {
+        for i in 0..6 {
+            let local_plane = &self.local_frustum_planes[i];
+            // Transform samplepoint to world space
+            let world_samplepoint = self.transform.transform.project_point3(local_plane.samplepoint);
+            // Transform normal to world space (only rotation matters for normals)
+            let world_normal = (self.transform.transform.transform_vector3(local_plane.normal)).normalize();
+            
+            self.world_frustum_planes[i] = Plane { normal: world_normal, samplepoint: world_samplepoint };
+        }
+    }
+
+
+    /* Gemini wrote this function */
+    pub fn clip_tri_near_plane(&self, raw_tri: [usize; 3], verts: &Vec<VertexData>)  -> Vec<[VertexData; 3]> {
+        let near_plane = &self.world_frustum_planes[4]; // Near Plane is at index 4
+        
+        // Check which vertices are "in" (dot product >= 0)
+        let mut inside = Vec::new();
+        let mut outside = Vec::new();
+        let tri = [verts[raw_tri[0]], verts[raw_tri[1]], verts[raw_tri[2]]];
+
+        for v in tri {
+            if near_plane.normal.dot(v.position - near_plane.samplepoint) >= 0.0 {
+                inside.push(v);
+            } else {
+                outside.push(v);
+            }
+        }
+
+        match inside.len() {
+            0 => vec![], // All outside
+            3 => vec![tri], // All inside
+            1 => {
+                // One inside: Triangle becomes a smaller triangle
+                let v_in = inside[0];
+                let t1 = near_plane.intersect_line_factor(v_in.position, outside[0].position);
+                let t2 = near_plane.intersect_line_factor(v_in.position, outside[1].position);
+                vec![[v_in, v_in.lerp(outside[0], t1), v_in.lerp(outside[1], t2)]]
+            }
+            2 => {
+                // Two inside: Triangle becomes a Quad (two triangles)
+                let v_in1 = inside[0];
+                let v_in2 = inside[1];
+                let v_out = outside[0];
+                let t1 = near_plane.intersect_line_factor(v_in1.position, v_out.position);
+                let t2 = near_plane.intersect_line_factor(v_in2.position, v_out.position);
+                
+                let clip1 = v_in1.lerp(v_out, t1);
+                let clip2 = v_in2.lerp(v_out, t2);
+                
+                vec![[v_in1, v_in2, clip1], [clip1, v_in2, clip2]]
+            }
+            _ => vec![],
+        }
+    }
+
+    /* DOESN'T REALLY WORK */
     // Check if a triangle is wholly or partially in the view frustum, and return one of three options:
     // 1. If 0 vertices are visible, return None.
     // 2. If 1 or 3 vertices are contained, return Some(triangle) with the triangle or the version of it
     // clipped to the frustum.
     // 3. If 2 vertices are contained, return the two triangles that make up the rect that is visible.
-    pub fn clip_tri_to_frustum(&self, tri: [usize; 3], verts: &Vec<Vec3>) -> Option<Vec<[Vec3; 3]>> {
+    pub fn clip_tri_to_frustum(&self, tri: [usize; 3], verts: &Vec<VertexData>) -> Option<Vec<[VertexData; 3]>> {
         // Get the vertices of the triangle
-        let v1 = verts[tri[0]];
-        let v2 = verts[tri[1]];
-        let v3 = verts[tri[2]];
+        let v1 = verts[tri[0]].position;
+        let v2 = verts[tri[1]].position;
+        let v3 = verts[tri[2]].position;
 
         // Check if the triangle is in the frustum
         let mut visible_verts = [3, 3];
@@ -127,7 +361,7 @@ impl Camera {
                 _ => v3,
             };
             let mut planes_passed = 0;
-            for plane in self.frustum_planes.iter() {
+            for plane in self.world_frustum_planes.iter() {
                 if plane.normal.dot(v - plane.samplepoint) >= 0. {
                     planes_passed += 1;
                 } else {
@@ -148,7 +382,7 @@ impl Camera {
                 } else if visible_verts[1] != 3 {
                     visible_verts[1] = i;
                 } else {
-                    return Some(vec![[v1, v2, v3]]); // If both slots are filled and the third vertex is also visible, the triangle is fully visible
+                    return Some(vec![[verts[tri[0]], verts[tri[1]], verts[tri[2]]]]); // If both slots are filled and the third vertex is also visible, the triangle is fully visible
                 }
             }
         }
@@ -173,18 +407,18 @@ impl Camera {
                     };
                     
                     // Populate clip_v with the intersections of the edge with each plane that v does not pass
-                    let mut clip_v: Vec<Vec3> = Vec::new();
+                    let mut clip_v: Vec<VertexData> = Vec::new();
                     for &planeidx in planes_not_passed[i].iter() {
-                        let intersection = self.frustum_planes[planeidx].intersect_line(vert_in, v_out);
-                        clip_v.push(intersection);
+                        let t = self.world_frustum_planes[planeidx].intersect_line_factor(vert_in.position, v_out.position);
+                        clip_v.push(vert_in.lerp(v_out, t));
                     }
                     // Set clip_a and clip_b to the nearest intersection points
                     match i {
                         0 => clip_a = clip_v.into_iter().min_by(|&a, &b|
-                                                                         (a - self.transform.location).length().partial_cmp(&(b - self.transform.location).length()).unwrap())
+                                                                         (a.position - self.transform.location).length().partial_cmp(&(b.position - self.transform.location).length()).unwrap())
                                                                         .unwrap(),
                         _ => clip_b = clip_v.into_iter().min_by(|&a, &b|
-                                                                         (a - self.transform.location).length().partial_cmp(&(b - self.transform.location).length()).unwrap())
+                                                                         (a.position - self.transform.location).length().partial_cmp(&(b.position - self.transform.location).length()).unwrap())
                                                                         .unwrap(),
                     }
                 }
@@ -209,18 +443,18 @@ impl Camera {
                     };
                     
                     // Populate clip_v with the intersections of the edge with each plane that vert_out does not pass
-                    let mut clip_v: Vec<Vec3> = Vec::new();
+                    let mut clip_v: Vec<VertexData> = Vec::new();
                     for &planeidx in planes_not_passed[0].iter() {
-                        let intersection = self.frustum_planes[planeidx].intersect_line(v_in, vert_out);
-                        clip_v.push(intersection);
+                        let t = self.world_frustum_planes[planeidx].intersect_line_factor(v_in.position, vert_out.position);
+                        clip_v.push(v_in.lerp(vert_out, t));
                     }
                     // Set clip_a and clip_b to the nearest intersection points
                     match i {
                         0 => clip_a = clip_v.into_iter().min_by(|&x, &y|
-                                                                         (x - self.transform.location).length().partial_cmp(&(y - self.transform.location).length()).unwrap())
+                                                                         (x.position - self.transform.location).length().partial_cmp(&(y.position - self.transform.location).length()).unwrap())
                                                                         .unwrap(),
                         _ => clip_b = clip_v.into_iter().min_by(|&x, &y|
-                                                                         (x - self.transform.location).length().partial_cmp(&(y - self.transform.location).length()).unwrap())
+                                                                         (x.position - self.transform.location).length().partial_cmp(&(y.position - self.transform.location).length()).unwrap())
                                                                         .unwrap(),
                     }
                 }
@@ -234,25 +468,56 @@ impl Camera {
         }
     }
 
-    pub fn project_tri(&self, tri: [Vec3; 3]) -> ([FPoint; 3], f32) {
-        // For each vertex, calculate the corresponding screen location
-        let p1 = self.project_point(self.transform.invtransform.project_point3(tri[0]));
-        let p2 = self.project_point(self.transform.invtransform.project_point3(tri[1]));
-        let p3 = self.project_point(self.transform.invtransform.project_point3(tri[2]));
+    pub fn project_mesh(&self, mesh: &Mesh) -> Vec<ScreenTri> {
+        // Project geometry to the screen
+        // Each screen triangle is a tuple of: screenspace vertices, centroid depth, material index, 3D vertex data])
+        let mut screen_tris = Vec::new();
+        let verts= mesh.verts.iter()
+                                                .map(|v| VertexData {normal: mesh.transform.transform.transform_vector3(v.normal), depth: 0., position: mesh.transform.transform.project_point3(v.position)})
+                                                .collect::<Vec<VertexData>>();
+        for i in 0..mesh.tris.len() {
+            let tri_verts = [verts[mesh.tris[i][0]], verts[mesh.tris[i][1]], verts[mesh.tris[i][2]]];
+            
+            // Backface Culling: Calculate normal and check if it faces the camera
+            let edge1 = tri_verts[1].position - tri_verts[0].position;
+            let edge2 = tri_verts[2].position - tri_verts[0].position;
+            let tri_normal = edge1.cross(edge2);
+            let view_dir = tri_verts[0].position - self.transform.location;
 
-        let centroid = (tri[0] + tri[1] + tri[2]) / 3.;
-        let depth = self.transform.location.distance(centroid);
+            if tri_normal.dot(view_dir) >= 0. { continue; }
+
+            let clipped_tri = self.clip_tri_near_plane(mesh.tris[i], &verts);
+            for tri in clipped_tri.iter() {
+                let (screen_tri, cdepth, vdepths) = self.project_tri(tri.map(|v| v.position));
+
+                screen_tris.push((screen_tri, cdepth, mesh.matIdcs[i], [VertexData { normal: tri[0].normal, position: tri[0].position, depth: vdepths[0] },
+                                                                    VertexData { normal: tri[1].normal, position: tri[1].position, depth: vdepths[1] },
+                                                                    VertexData { normal: tri[2].normal, position: tri[2].position, depth: vdepths[2] }]));
+            }
+        }
+
+        screen_tris
+    }
+
+    pub fn project_tri(&self, tri: [Vec3; 3]) -> ([FPoint; 3], f32, [f32; 3]) {
+        // For each vertex, calculate the corresponding screen location
+        let (p1, depth1) = self.project_point(self.transform.invtransform.project_point3(tri[0]));
+        let (p2, depth2) = self.project_point(self.transform.invtransform.project_point3(tri[1]));
+        let (p3, depth3) = self.project_point(self.transform.invtransform.project_point3(tri[2]));
+
+        let vdepths = [depth1, depth2, depth3];
+        let cdepth = (depth1 + depth2 + depth3) / 3.0;
 
         // Place the three screenspace points in an array and return them
         let frag = [p1, p2, p3];
-        return (frag, depth);
+        return (frag, cdepth, vdepths);
     }
     
-    fn project_point(&self, v: Vec3) -> FPoint {
-        let projv = self.proj_mat.project_point3(v);
-        let dx = self.aspect_ratio*self.pixelscale*projv.x/projv.z;
-        let dy = self.pixelscale*projv.y/projv.z;
-        return FPoint::new(self.target_width as f32/2. + dx, self.target_height as f32/2. - dy);
+    fn project_point(&self, v: Vec3) -> (FPoint, f32) {
+        // Direct perspective projection instead of using broken proj_mat
+        let dx = self.aspect_ratio * self.pixelscale * self.focal_length * v.x / v.z;
+        let dy = self.pixelscale * self.focal_length * v.y / v.z;
+        return (FPoint::new(self.target_width as f32/2. + dx, self.target_height as f32/2. - dy), v.z);
     }
 }
 
@@ -268,10 +533,8 @@ impl TransformComponent {
     pub fn offset(&mut self, delta: Vec3) {
         let mut dmat = Mat4::IDENTITY;
         dmat.w_axis = delta.extend(1.);
-        //println!("{}", self.location);
         self.location = dmat.project_point3(self.location);
         self.update_transform();
-        //println!("{}", self.location);
     }
 
     // Why the heck is the x-axis controlling horizontal and the y-axis controlling vertical?
@@ -328,15 +591,17 @@ impl TransformComponent {
 
 /* Global Functions */
 
-pub fn read_geometry(path_prefix: &str, p: &str, vert_target: &mut Vec<Vec3>, tri_target: &mut Vec<[usize; 3]>, matIdcs_target: &mut Vec<usize>, mat_target: &mut Vec<Material>) {
+pub fn read_geometry(path_prefix: &str, p: &str, vert_target: &mut Vec<VertexData>, tri_target: &mut Vec<[usize; 3]>, matIdcs_target: &mut Vec<usize>, mat_target: &mut Vec<Material>) {
     println!("reading...");
 
     // Materials
     let r_file_mats: std::fs::File = std::fs::File::open(path_prefix.to_owned() + p + ".mtl").expect(("mtl file '".to_owned() + p + ".mtl' not found at location\n" + path_prefix + p + ".mtl").as_str());
     let f_mats = BufReader::new(r_file_mats);
     let mut materials = HashMap::new();
+    let mut vert_pos = Vec::new();
+    let mut vert_norm = Vec::new();
     let mut mat_name: String = String::new();
-    let mut mat_col = Material::DEFAULT.color;
+    let mut mat_col = Material::DEFAULT.base_color;
     for line in f_mats.lines().filter_map(|result| result.ok()) {
         if !line.is_empty() {
             let segs: Vec<&str> = line.split(' ').collect();
@@ -344,15 +609,17 @@ pub fn read_geometry(path_prefix: &str, p: &str, vert_target: &mut Vec<Vec3>, tr
                 mat_name = segs[1].to_string().clone();
             }
             else if segs[0] == "Kd" {
-                mat_col = Color::RGB((segs[1].parse::<f32>().unwrap() * 255.) as u8, (segs[2].parse::<f32>().unwrap() * 255.) as u8, (segs[3].parse::<f32>().unwrap() * 255.) as u8)
+                mat_col = glam::Vec4::new(segs[1].parse::<f32>().unwrap(), segs[2].parse::<f32>().unwrap(), segs[3].parse::<f32>().unwrap(), 1.)
             }
 
-            materials.insert(mat_name.clone(), Material { color: mat_col });
+            materials.insert(mat_name.clone(), Material { base_color: mat_col });
         }
     }
 
-    // Create a vector of all the materials in the order they were read, for indexing during rendering
-    for (_, m) in materials.iter() {
+    // Create a vector of all the materials and a map for their indices
+    let mut mat_name_to_idx = HashMap::new();
+    for (name, m) in materials.iter() {
+        mat_name_to_idx.insert(name.clone(), mat_target.len());
         mat_target.push(*m);
     }
 
@@ -367,31 +634,57 @@ pub fn read_geometry(path_prefix: &str, p: &str, vert_target: &mut Vec<Vec3>, tr
             let chars: Vec<char> = line.chars().collect();
             let segs: Vec<&str> = line.split(' ').collect();
             // Verts
-            if chars[0] == 'v' && chars[1] == ' ' {
-                vert_target.push(Vec3 { x: segs[1].parse().unwrap(), y: segs[2].parse().unwrap(), z: segs[3].parse().unwrap() });
-            }
-            // Tris (and assign Mats)
-            else if chars[0] == 'f' && chars[1] == ' ' {
-                let is1: Vec<&str> = segs[1].split('/').collect();
-                let is2: Vec<&str> = segs[2].split('/').collect();
-                let is3: Vec<&str> = segs[3].split('/').collect();
-                tri_target.push([is1[0].parse::<usize>().unwrap() - 1,
-                                 is2[0].parse::<usize>().unwrap() - 1,
-                                 is3[0].parse::<usize>().unwrap() - 1]);
+            if chars[1] == ' ' {
+                match chars[0] {
+                    'v' => {
+                        vert_pos.push(Vec3 { x: segs[1].parse().unwrap(), y: segs[2].parse().unwrap(), z: segs[3].parse().unwrap() });
+                    },
+                    'f' => {
+                        /* Gemini block */
+                        let corners = [segs[1], segs[2], segs[3]];
+                        let start_idx = vert_target.len();
 
-                // Find the index of the current material in the master map, and index
-                // that position in the material indices vector.
-                let mut current_idx: usize = 0;
-                for (n, _) in materials.iter() {
-                    if n == &mat_name {
-                        matIdcs_target.push(current_idx);
-                        break;
-                    }
-                    current_idx+=1;
+                        for corner in corners {
+                            let parts: Vec<&str> = corner.split('/').collect();
+                            
+                            // 1. Get the position index (first part)
+                            let v_idx = parts[0].parse::<usize>().unwrap() - 1;
+                            
+                            // 2. Get the normal index (third part, if it exists)
+                            let vn_idx = if parts.len() >= 3 && !parts[2].is_empty() {
+                                parts[2].parse::<usize>().unwrap() - 1
+                            } else {
+                                0 // Fallback if the file is missing normals
+                            };
+
+                            // 3. Weld them into a single unique VertexData
+                            vert_target.push(VertexData {
+                                position: vert_pos[v_idx],
+                                normal: if vert_norm.is_empty() { Vec3::ZERO } else { vert_norm[vn_idx] },
+                                depth: 0.0,
+                            });
+                        }
+
+                        // 4. Triangle indices always point to the 3 most recently added vertices
+                        tri_target.push([start_idx, start_idx + 1, start_idx + 2]);
+                        /* end of Gemini block */
+
+                        // Find the index of the current material in the master map, and index
+                        // that position in the material indices vector.
+                        if let Some(&idx) = mat_name_to_idx.get(&mat_name) {
+                            matIdcs_target.push(idx);
+                        } else {
+                            matIdcs_target.push(0); // Fallback
+                        }
+                    },
+                    _ => {}
                 }
-            }
             // Loading Mats
+            }
             else {
+                if segs[0] == "vn" {
+                    vert_norm.push(Vec3 { x: segs[1].parse().unwrap(), y: segs[2].parse().unwrap(), z: segs[3].parse().unwrap() });
+                }
                 if segs[0] == "usemtl" {
                     mat_name = segs[1].to_string();
                 }

@@ -10,3 +10,4 @@ edition = "2021"
 sdl3 = { version = "0.15.1" }
 glam = { version = "*" }
 rand = "*"
+derive-new = "0.7.0"

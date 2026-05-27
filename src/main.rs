@@ -9,102 +9,96 @@ extern crate rand;
 mod geo_engine;
 mod gfx_engine;
 
-pub use geo_engine::*;
+use geo_engine::*;
+use gfx_engine::ScreenTri;
 
 use sdl3::pixels::{Color, PixelFormat};
-use sdl3::render::{FPoint, Texture, TextureAccess};
+use sdl3::render::{FPoint, Texture, TextureAccess, Vertex};
 use sdl3::keyboard::Keycode;
 use sdl3::event::Event::KeyDown;
 
 use glam::Vec3;
 
+#[derive(Clone, Copy)]
+pub struct PreRenderData {
+    SCREEN_WIDTH: u16,
+    SCREEN_HEIGHT: u16,
+    FRUSTUM_INSET: f32,
+    CLIPDIST: f32,
+}
 
-fn main() {
-    static SCREEN_WIDTH: u16 = 1280;
-    static SCREEN_HEIGHT: u16 = 720;
-    static FRUSTUM_INSET: f32 = 5.;
+const MOVE_SPEED: f32 = 1.;
 
-    let move_speed = 1.;
-    
-    //Read the OBJ file's data
-    let uwb = std::env::current_dir().unwrap();
-    let path_prefix = uwb.to_str().unwrap();
-    let local_path = "/resources/CubeScene";
-    let mut verts = Vec::new();
-    let mut tris = Vec::new();
-    let mut matIdcs = Vec::new();
-    let mut materials = Vec::new();
-    read_geometry(path_prefix, local_path, &mut verts, &mut tris, &mut matIdcs, &mut materials);
-
+pub fn start(title: &str, pre_data: PreRenderData, geometry: &Vec<Mesh>, materials: &Vec<gfx_engine::Material>) {
     let sdl = sdl3::init().unwrap();
     let vsub = sdl.video().unwrap();
-    let window = vsub.window("Raster Renderer", SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32).resizable().build().unwrap();
-    
-    sdl.mouse();
-    sdl.mouse().set_relative_mouse_mode(&window, true);
-    sdl.mouse().warp_mouse_in_window(&window, (SCREEN_WIDTH/2) as f32, (SCREEN_HEIGHT/2) as f32);
-
+    let window = vsub.window("Raster Renderer", pre_data.SCREEN_WIDTH as u32, pre_data.SCREEN_HEIGHT as u32).resizable().build().unwrap();
     let mut canvas = window.into_canvas();
-
     let texture_creator = canvas.texture_creator();
     let pixel_format = canvas.default_pixel_format();
-    let mut render_surf = gfx_engine::Surface::new(SCREEN_WIDTH, SCREEN_HEIGHT, pixel_format, &texture_creator);
-    let mut viewer = Camera::new(Vec3::new(0., 0., 0.), 2.5, SCREEN_WIDTH as u32, SCREEN_HEIGHT as u32, 1000., FRUSTUM_INSET/* clipdist */, FRUSTUM_INSET);
-    
-    let mut event_pump = sdl.event_pump().unwrap();
+    let context = gfx_engine::ShaderContext::new(Vec3::ZERO, Vec3::ZERO, sdl3::pixels::Color::WHITE);
 
-    let mut framectr: u8 = 0;
-    let mut frametime_avg = 0.;
+    let mut render_surf = gfx_engine::Surface::new(pre_data.SCREEN_WIDTH, pre_data.SCREEN_HEIGHT, pixel_format, &texture_creator);
+    let mut viewer = Camera::new(Vec3::new(20., 0., -20.), 2.5, pre_data.SCREEN_WIDTH as u32, pre_data.SCREEN_HEIGHT as u32,
+                                         1000., pre_data.CLIPDIST, pre_data.FRUSTUM_INSET);
+    
+    let mut first_frame = true;
+    let mut event_pump = sdl.event_pump().unwrap();
     'gl: loop {
-        let start_frametime = std::time::Instant::now();
+        if first_frame {
+            sdl.mouse().set_relative_mouse_mode(canvas.window(), true);
+            sdl.mouse().warp_mouse_in_window(canvas.window(), (pre_data.SCREEN_WIDTH/2) as f32, (pre_data.SCREEN_HEIGHT/2) as f32);
+            sdl.mouse().show_cursor(false);
+            first_frame = false;
+        }
+        let _start_frametime = std::time::Instant::now();
         for event in event_pump.poll_iter() {match event {
                 sdl3::event::Event::Quit {..} | sdl3::event::Event::KeyDown { keycode: Some(Keycode::Escape), .. } => break 'gl,
                 sdl3::event::Event::MouseMotion { xrel, yrel, .. } => {viewer.transform.rotate(1, xrel as f32 * 1.);
-                                                                                 viewer.transform.rotate(0, yrel as f32 * -1.);},
-                KeyDown { keycode: Some(Keycode::Right), .. } => viewer.transform.rotate(1, 5.),
-                KeyDown { keycode: Some(Keycode::W), .. } => viewer.transform.offset(viewer.transform.forward * move_speed),
-                KeyDown { keycode: Some(Keycode::S), .. } => viewer.transform.offset(viewer.transform.forward * -move_speed),
-                KeyDown { keycode: Some(Keycode::A), .. } => viewer.transform.offset(viewer.transform.right * -move_speed),
-                KeyDown { keycode: Some(Keycode::D), .. } => viewer.transform.offset(viewer.transform.right * move_speed),
-                KeyDown { keycode: Some(Keycode::Q), .. } => println!("Avg frame time {} ms", frametime_avg),
+                                                                                 viewer.transform.rotate(0, yrel as f32 * -1.);
+                                                                                 viewer.update_frustum_planes();},
+                KeyDown { keycode: Some(Keycode::Right), .. } => {viewer.transform.rotate(1, 5.); viewer.update_frustum_planes();},
+                KeyDown { keycode: Some(Keycode::W), .. } => {viewer.transform.offset(viewer.transform.forward * MOVE_SPEED); viewer.update_frustum_planes();},
+                KeyDown { keycode: Some(Keycode::S), .. } => {viewer.transform.offset(viewer.transform.forward * -MOVE_SPEED); viewer.update_frustum_planes();},
+                KeyDown { keycode: Some(Keycode::A), .. } => {viewer.transform.offset(viewer.transform.right * -MOVE_SPEED); viewer.update_frustum_planes();},
+                KeyDown { keycode: Some(Keycode::D), .. } => {viewer.transform.offset(viewer.transform.right * MOVE_SPEED); viewer.update_frustum_planes();},
                 _ => {},
             }}
         
         //let mousex; let mousey;
         //sdl3-sys::SDL_GetMouseState(&mut mousex, &mut mousey);
         
-        // Project geometry to the screen
-        let mut screen_tris = Vec::new();
-        for i in 0..tris.len() {
-            match viewer.clip_tri_to_frustum(tris[i], &verts) {
-                Some(clipped_tri) => { // If the triangle is valid, render it
-                    for tri in clipped_tri.iter() {
-                        let (screen_tri, depth) = viewer.project_tri(*tri);
-                        if render_surf.clip_tri_to_screen(screen_tri) {
-                            screen_tris.push((screen_tri, depth, matIdcs[i]));
-                        }
-                    }
-                },
-                None => {}, // If the triangle is invalid, do nothing
-            }
-        }
+        let mut screen_tris = geometry.iter()
+                                                                    .flat_map(|mesh| viewer.project_mesh(mesh))
+                                                                    .collect::<Vec<ScreenTri>>();
 
         // Draw the projected geometry to the render surface
-        render_surf.render_tris(&mut screen_tris, &materials);
+        render_surf.render_tris(&mut screen_tris, &materials, &context);
 
     // Present the scene and FPS Timestep
         canvas.set_draw_color(Color::BLACK);
         canvas.clear();
         canvas.copy(&render_surf.render_tex, None, None);
         canvas.present();
-        //std::thread::sleep(std::time::Duration::new(0, 1_000_000_000u32 / 144 as u32));
-        if framectr < 15. as u8 {
-            framectr += 1;
-        } else {
-            frametime_avg -= frametime_avg / 15.;
-        }
-        frametime_avg += (start_frametime.elapsed().as_secs_f32() * 1000.)/15.;
 
     }
     
+}
+
+fn main() {
+    static PRE_DATA: PreRenderData = PreRenderData {
+        SCREEN_WIDTH: 1280,
+        SCREEN_HEIGHT: 720,
+        FRUSTUM_INSET: -1.,
+        CLIPDIST: 1.
+    };
+    
+    //Read the OBJ file's data
+    let uwb = std::env::current_dir().unwrap();
+    let path_prefix = uwb.to_str().unwrap();
+    let local_path = "/resources/Leviathan";
+
+    let mut mat_lib = MaterialLibrary::new();
+    let geo = vec![Mesh::from_obj(path_prefix, local_path, Vec3::new(0., 0., 0.), &mut mat_lib)];
+    start("Raster Renderer", PRE_DATA, &geo, &mat_lib.materials);
 }
